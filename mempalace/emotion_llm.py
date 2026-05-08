@@ -80,6 +80,12 @@ RULES:
   Use everyday spoken voice in the SAME language as the content. NOT clinical
   or third-person ("the user expressed..."). Empty string if intensity=0
   or content is purely informational.
+- If the content is mostly direct quotes, narrative excerpts, or
+  third-party records (not the speaker's own words — e.g. blockquote
+  lines starting with ">", quoted novel passages, transcripts), tag the
+  SPEAKER's reaction to the material — NOT the emotions inside the
+  quotes. If the speaker barely reacts (records or quotes without
+  commentary), set intensity=0.
 - Output valid JSON only. No code fences. No commentary.
 """
 
@@ -136,6 +142,23 @@ def _call_llm_for_emotion(cfg: LLMConfig, content: str):
     return None, None
 
 
+_QUOTE_LINE = re.compile(r"^\s*>")
+
+
+def _estimate_quote_ratio(text: str) -> float:
+    """Fraction of non-blank lines that are blockquote markers.
+
+    1.0 = pure quoted material; 0.0 = no markdown blockquote at all.
+    Used as a coarse signal that a source file (when aggregated) is
+    dominated by third-party text rather than the speaker's own voice.
+    """
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if not lines:
+        return 0.0
+    quote_lines = sum(1 for ln in lines if _QUOTE_LINE.match(ln))
+    return quote_lines / len(lines)
+
+
 def _normalize_parsed(parsed: dict) -> dict:
     """Coerce LLM output into the metadata schema. ChromaDB metadata can't
     hold None/list, so we flatten and cap."""
@@ -179,6 +202,7 @@ def tag_emotions(
     sample: int = 0,
     dry_run: bool = False,
     force: bool = False,
+    max_quote_ratio: float = 1.0,
     cfg: Optional[LLMConfig] = None,
 ):
     """Tag drawers with emotional metadata.
@@ -231,6 +255,33 @@ def tag_emotions(
                 continue
             eligible.append((doc_id, doc, meta))
         offset += len(ids)
+
+    # Source-level filter: when an entire source file is dominated by
+    # blockquoted material (e.g. reading-companion sessions where the
+    # user pastes long novel passages), skip it. The prompt also has
+    # a per-drawer guard, but coarse source-level skipping saves LLM
+    # tokens and avoids edge cases where local quote density misleads.
+    if max_quote_ratio < 1.0 and eligible:
+        src_groups: dict = {}
+        for doc_id, doc, meta in eligible:
+            src = meta.get("source_file", "")
+            src_groups.setdefault(src, []).append(doc)
+        high_quote_sources = set()
+        for src, docs in src_groups.items():
+            ratio = _estimate_quote_ratio("\n".join(docs))
+            if ratio > max_quote_ratio:
+                high_quote_sources.add(src)
+        if high_quote_sources:
+            before = len(eligible)
+            eligible = [
+                (i, d, m) for (i, d, m) in eligible
+                if m.get("source_file", "") not in high_quote_sources
+            ]
+            print(
+                f"Skipped {before - len(eligible)} drawers from "
+                f"{len(high_quote_sources)} source files with quote ratio "
+                f"> {max_quote_ratio}"
+            )
 
     if sample > 0:
         eligible = eligible[:sample]
@@ -344,6 +395,15 @@ def main():
         help=f"Re-tag drawers even if they already match emotion_version={EMOTION_VERSION}",
     )
     parser.add_argument(
+        "--max-quote-ratio",
+        type=float,
+        default=1.0,
+        help="Skip source files whose blockquote-line ratio exceeds this "
+        "threshold (e.g. 0.5 = drop files where >50%% of non-blank lines "
+        "are blockquotes). Default 1.0 disables the filter. Useful for "
+        "backfill of palaces with reading-companion data.",
+    )
+    parser.add_argument(
         "--endpoint",
         default=None,
         help="LLM base URL (overrides $LLM_ENDPOINT)",
@@ -368,6 +428,7 @@ def main():
         sample=args.sample,
         dry_run=args.dry_run,
         force=args.force,
+        max_quote_ratio=args.max_quote_ratio,
         cfg=cfg,
     )
 
