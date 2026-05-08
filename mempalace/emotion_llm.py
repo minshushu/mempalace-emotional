@@ -53,6 +53,10 @@ DEFAULT_ROOMS = ("emotional", "milestone")
 # concatenation closet_llm sends, so we cap lower.
 MAX_CONTENT_CHARS = 8000
 MAX_OUTPUT_TOKENS = 400
+# Mining sometimes emits single-line blockquotes or message-header chunks
+# (e.g. just a "## user @ timestamp" line). Below this many chars we skip
+# the LLM call and tag neutral directly.
+MIN_CONTENT_CHARS_DEFAULT = 50
 
 PROMPT_TEMPLATE = """You are reading a memory drawer. Tag it with emotional metadata.
 
@@ -203,6 +207,7 @@ def tag_emotions(
     dry_run: bool = False,
     force: bool = False,
     max_quote_ratio: float = 1.0,
+    min_content_chars: int = MIN_CONTENT_CHARS_DEFAULT,
     cfg: Optional[LLMConfig] = None,
 ):
     """Tag drawers with emotional metadata.
@@ -300,16 +305,42 @@ def tag_emotions(
     processed = 0
     failed = 0
     neutral_count = 0
+    short_skipped = 0
     total_input = 0
     total_output = 0
 
     for i, (doc_id, doc, meta) in enumerate(eligible, 1):
+        is_short = len(doc.strip()) < min_content_chars
+
         if dry_run:
             preview = doc[:60].replace("\n", " ")
+            tag = " [SHORT→neutral]" if is_short else ""
             print(
                 f"  [{i}/{len(eligible)}] "
-                f"{meta.get('wing')}/{meta.get('room')} — {preview}..."
+                f"{meta.get('wing')}/{meta.get('room')}{tag} — {preview}..."
             )
+            continue
+
+        if is_short:
+            # No standalone meaning — write neutral directly so we don't
+            # spend a token call on a "## user @ ..." header or a single
+            # blockquote line, and so the next run skips it via the
+            # emotion_version gate.
+            emotion_meta = {
+                "intensity": 0,
+                "emotion_label": "",
+                "reflection": "",
+                "emotion_version": EMOTION_VERSION,
+            }
+            new_meta = {**meta, **emotion_meta}
+            try:
+                drawers_col.update(ids=[doc_id], metadatas=[new_meta])
+            except Exception as e:
+                failed += 1
+                print(f"  [{i}/{len(eligible)}] ✗ {doc_id[:30]} — write failed: {e}")
+                continue
+            processed += 1
+            short_skipped += 1
             continue
 
         parsed, usage = _call_llm_for_emotion(cfg, doc)
@@ -348,7 +379,11 @@ def tag_emotions(
             f"— intensity={emotion_meta['intensity']} label={label_disp!r}"
         )
 
-    print(f"\nDone. {processed} tagged ({neutral_count} neutral), {failed} failed.")
+    print(
+        f"\nDone. {processed} tagged "
+        f"({neutral_count} LLM-neutral, {short_skipped} short-skipped), "
+        f"{failed} failed."
+    )
     if total_input or total_output:
         print(f"Tokens: {total_input:,} in + {total_output:,} out (cost depends on provider)")
 
@@ -356,6 +391,7 @@ def tag_emotions(
         "processed": processed,
         "failed": failed,
         "neutral": neutral_count,
+        "short_skipped": short_skipped,
         "input_tokens": total_input,
         "output_tokens": total_output,
     }
@@ -404,6 +440,15 @@ def main():
         "backfill of palaces with reading-companion data.",
     )
     parser.add_argument(
+        "--min-content-chars",
+        type=int,
+        default=MIN_CONTENT_CHARS_DEFAULT,
+        help=f"Chunks shorter than this are tagged neutral without an LLM "
+        f"call (default {MIN_CONTENT_CHARS_DEFAULT}). Mining sometimes emits "
+        "single-line headers or blockquote lines as standalone chunks; they "
+        "carry no standalone meaning. Set to 0 to disable.",
+    )
+    parser.add_argument(
         "--endpoint",
         default=None,
         help="LLM base URL (overrides $LLM_ENDPOINT)",
@@ -429,6 +474,7 @@ def main():
         dry_run=args.dry_run,
         force=args.force,
         max_quote_ratio=args.max_quote_ratio,
+        min_content_chars=args.min_content_chars,
         cfg=cfg,
     )
 
