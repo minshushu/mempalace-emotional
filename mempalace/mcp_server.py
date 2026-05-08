@@ -696,6 +696,8 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    emotion_mode: str = "off",
+    emotion_query: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -703,12 +705,23 @@ def tool_search(
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+    # Validate emotion_mode at the MCP boundary so internal callers can stay
+    # permissive. Unknown values are noisy errors, not silent fallbacks.
+    if emotion_mode not in ("off", "blend", "primary"):
+        return {
+            "error": f"emotion_mode must be one of: off / blend / primary (got {emotion_mode!r})"
+        }
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    # Sanitize emotion_query if provided — same prompt-injection defense as
+    # the main query path. Empty/None passes through unchanged.
+    sanitized_eq = None
+    if emotion_query:
+        sanitized_eq = sanitize_query(emotion_query)["clean_query"]
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -723,6 +736,8 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        emotion_mode=emotion_mode,
+        emotion_query=sanitized_eq,
     )
     if _vector_disabled:
         result["vector_disabled"] = True

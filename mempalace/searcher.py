@@ -118,11 +118,34 @@ def _bm25_scores(
     return scores
 
 
+def _cosine_sim(a, b) -> float:
+    """Cosine similarity between two equal-length numeric sequences.
+
+    Returns 0.0 on zero-norm or shape mismatch — callers can treat that as
+    "no signal" without special-casing.
+    """
+    if a is None or b is None or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
 def _hybrid_rank(
     results: list,
     query: str,
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
+    emotion_weight: float = 0.0,
+    emotion_query=None,
+    drawers_col=None,
 ) -> list:
     """Re-rank ``results`` by a convex combination of vector similarity and BM25.
 
@@ -150,15 +173,66 @@ def _hybrid_rank(
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
+    # Emotion-aware signal:
+    #   signal_i = cosine(emotion_query, drawer_i.emotion_label) × intensity_i/10
+    # Only computed when caller passes emotion_weight > 0 AND drawers_col (so
+    # we can borrow its embedding function — the same model used to embed the
+    # drawer documents, keeping query and label vectors in one space).
+    # When intensity=0 or label is empty, signal=0 — those drawers fall back
+    # to BM25+cosine ranking without polluting the emotion channel.
+    emotion_signals = [0.0] * len(results)
+    if emotion_weight > 0 and drawers_col is not None:
+        target_text = (emotion_query or query) or ""
+        labels = [(r.get("_emotion_label") or "") for r in results]
+        intensities = []
+        for r in results:
+            try:
+                intensities.append(int(r.get("_intensity") or 0))
+            except (TypeError, ValueError):
+                intensities.append(0)
+        has_signal = any(lbl and itn for lbl, itn in zip(labels, intensities))
+        if has_signal and target_text.strip():
+            try:
+                ef = drawers_col._embedding_function
+                # Single batch embed: target + all labels (empty-label slots
+                # use a placeholder to keep batch indexing aligned; their
+                # signal is zeroed below regardless).
+                batch_in = [target_text] + [lbl if lbl else " " for lbl in labels]
+                embs = ef(batch_in)
+                target_emb = embs[0]
+                for i, (lbl, itn, lemb) in enumerate(
+                    zip(labels, intensities, embs[1:])
+                ):
+                    if not lbl or itn == 0:
+                        emotion_signals[i] = 0.0
+                    else:
+                        cos = max(0.0, _cosine_sim(target_emb, lemb))
+                        emotion_signals[i] = cos * (itn / 10.0)
+            except Exception:
+                logger.debug(
+                    "emotion-aware rerank embed failed; falling back to non-emotion ranking",
+                    exc_info=True,
+                )
+                emotion_signals = [0.0] * len(results)
+
     scored = []
-    for r, raw, norm in zip(results, bm25_raw, bm25_norm):
+    for r, raw, norm, esig in zip(results, bm25_raw, bm25_norm, emotion_signals):
         distance = r.get("distance")
         if distance is None:
             vec_sim = 0.0
         else:
             vec_sim = max(0.0, 1.0 - distance)
         r["bm25_score"] = round(raw, 3)
-        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
+        if emotion_weight > 0:
+            r["emotion_score"] = round(esig, 3)
+        scored.append(
+            (
+                vector_weight * vec_sim
+                + bm25_weight * norm
+                + emotion_weight * esig,
+                r,
+            )
+        )
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     results[:] = [r for _, r in scored]
@@ -724,6 +798,14 @@ def _apply_candidate_strategy(
         merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
 
 
+EMOTION_MODE_WEIGHTS = {
+    # (vector_weight, bm25_weight, emotion_weight) — must sum to 1.0
+    "off":     (0.60, 0.40, 0.00),  # upstream v3.3.4 default
+    "blend":   (0.45, 0.30, 0.25),
+    "primary": (0.30, 0.20, 0.50),
+}
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -734,6 +816,8 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    emotion_mode: str = "off",
+    emotion_query=None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -898,6 +982,8 @@ def search_memories(
             "_sort_key": effective_dist,
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
+            "_emotion_label": meta.get("emotion_label", "") or "",
+            "_intensity": meta.get("intensity", 0) or 0,
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
@@ -984,11 +1070,27 @@ def search_memories(
     # would return up to 4× ``n_results`` (vector hits + BM25 union pool),
     # breaking the existing ``search_memories`` size contract that the MCP
     # ``limit`` parameter is built on.
-    hits = _hybrid_rank(hits, query)[:n_results]
+    # Resolve emotion_mode → (vector_weight, bm25_weight, emotion_weight).
+    # Unknown modes silently fall back to "off" — strict validation lives at
+    # the MCP boundary so internal callers can stay simple.
+    vec_w, bm25_w, em_w = EMOTION_MODE_WEIGHTS.get(
+        emotion_mode, EMOTION_MODE_WEIGHTS["off"]
+    )
+    hits = _hybrid_rank(
+        hits,
+        query,
+        vector_weight=vec_w,
+        bm25_weight=bm25_w,
+        emotion_weight=em_w,
+        emotion_query=emotion_query,
+        drawers_col=drawers_col if em_w > 0 else None,
+    )[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
+        h.pop("_emotion_label", None)
+        h.pop("_intensity", None)
 
     return {
         "query": query,
