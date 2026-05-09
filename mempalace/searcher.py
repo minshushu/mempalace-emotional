@@ -882,6 +882,21 @@ def search_memories(
 
     where = build_where_filter(wing, room)
 
+    # Emotion-mode hard filter: when caller asked for emotion-aware ranking,
+    # restrict candidates to drawers carrying actual emotion signal
+    # (intensity >= 1). Without this, neutral chunks dominate via doc-cosine
+    # alone — emotion_signal=0 contributes nothing, but the BM25+vector
+    # baseline still pushes them to the top.
+    if emotion_mode != "off":
+        intensity_filter = {"intensity": {"$gte": 1}}
+        if where:
+            if "$and" in where:
+                where["$and"].append(intensity_filter)
+            else:
+                where = {"$and": [where, intensity_filter]}
+        else:
+            where = intensity_filter
+
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
     # GATE — direct drawer search is always the baseline.
