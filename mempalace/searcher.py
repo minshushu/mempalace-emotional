@@ -193,7 +193,18 @@ def _hybrid_rank(
         has_signal = any(lbl and itn for lbl, itn in zip(labels, intensities))
         if has_signal and target_text.strip():
             try:
-                ef = drawers_col._embedding_function
+                # MemPalace's ChromaCollection wrapper doesn't expose the
+                # embedding function directly; the real EF lives on the
+                # inner ChromaDB Collection. Reach through, fall back to
+                # ChromaDB's DefaultEmbeddingFunction if the inner shape
+                # changes in a future version.
+                inner = getattr(drawers_col, "_collection", drawers_col)
+                ef = getattr(inner, "_embedding_function", None)
+                if ef is None:
+                    from chromadb.utils.embedding_functions import (
+                        DefaultEmbeddingFunction,
+                    )
+                    ef = DefaultEmbeddingFunction()
                 # Single batch embed: target + all labels (empty-label slots
                 # use a placeholder to keep batch indexing aligned; their
                 # signal is zeroed below regardless).
