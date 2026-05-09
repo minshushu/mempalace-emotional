@@ -889,10 +889,17 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
+    # Emotion-aware ranking needs a wider candidate pool: high-intensity
+    # drawers may be document-cosine-distant from the query text (e.g. a
+    # memory tagged "悲伤,失去" written without the word "难过" won't surface
+    # in the cheap 3x pool), so the rerank stage has nothing to lift. With
+    # emotion_mode != "off", expand the pool so emotion-aware reranking
+    # actually has signal to work with.
+    candidate_multiplier = 3 if emotion_mode == "off" else 30
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": n_results * candidate_multiplier,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
